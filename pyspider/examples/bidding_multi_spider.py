@@ -18,8 +18,13 @@
     ihep        中科院高能所          http://www.ihep.ac.cn/xwdt2022/tzgg_1/
     caep        绵阳 CAEP 工物院      https://ztbxx.caep.ac.cn/
 
-阶段 2 (需要 cookie/登录/JS 渲染) 暂未接入：
-    gdedulscg / chinabidding / ebnew / szggzy / sustech / wisdombidding / ecnu_zcb /
+阶段 2 已接入的站点 (需要逆向 JSON API 或外链跟踪，无登录)：
+    szggzy      深圳公共资源交易网    https://www.szggzy.com/  (JSON API)
+    sustech     南方科大采购与招标    https://biddingoffice.sustech.edu.cn/
+                                      (列表纯 HTML，正文跟外链到 biddingholdings)
+
+阶段 2 剩余 (需要 cookie/登录) 暂未接入：
+    gdedulscg / chinabidding / ebnew / wisdombidding / ecnu_zcb /
     qdu / shanghaitech
 
 用法:
@@ -333,6 +338,21 @@ class BaseSite:
         title = title_el.get_text(strip=True) if title_el else ""
         return title, soup.body or soup, "", ""
 
+    # ---- 可选钩子：站点需要 POST / JSON / JS 渲染时覆盖 ----
+    def fetch_list(self, engine: "Engine", list_url: str, page: int) -> Optional[str]:
+        """默认走引擎的 GET。JSON API 站点可以覆盖成 POST 并返回一段 "HTML-like"
+        字符串（通常是打包过的 JSON 字符串，parse_list 再解回来）。"""
+        return engine._fetch(list_url, referer=self.home)
+
+    def fetch_detail(self, engine: "Engine", url: str, referer: str) -> Optional[str]:
+        """默认走引擎的 GET。需要 JSON 详情或跟外链的站点可以覆盖。"""
+        return engine._fetch(url, referer=referer)
+
+    def pre_filled_fields(self, url: str) -> Dict[str, str]:
+        """站点在列表页已经拿到了结构化字段（如 szggzy 的 JSON API），
+        可以返回一个字典，这些字段优先于 extract_pipeline 的结果。"""
+        return {}
+
 
 # ---------- 阶段 1 站点插件 ---------------------------------------------------
 
@@ -640,6 +660,268 @@ class CAEPSite(BaseSite):
         return title, body_el, category, publish_date
 
 
+# ---------- 阶段 2 站点插件 ---------------------------------------------------
+
+
+class SzggzySite(BaseSite):
+    """深圳公共资源交易网。主站是 Vue SPA，走内部 JSON API：
+
+    列表 POST https://www.szggzy.com/cms/api/v1/trade/content/page
+        body: {"modelId":M,"channelId":C,"parentBusinessType":"政采框采",
+               "page":N,"size":10,"siteId":1,...}
+    详情 GET  https://www.szggzy.com/cms/api/v1/trade/content/detail2?contentId=ID
+
+    列表接口一次返回 10 条含全部关键字段（projectCode / purchaseMan /
+    proxyComName / winnerName / releaseTime），因此 parse_list 直接把整条
+    record 序列化塞进 ListItem.url 之外的 'meta' 里，详情只补 `txt` 正文。
+
+    channelId 与业务类型对应关系 (观察页面 onclick/XHR 得到)：
+        zfcg    政府采购    channelId=2850 modelId=1378 parentBusinessType="政采框采"
+    阶段 2 先只接政采，其它栏目（建设工程/土地矿业等）后续再按需扩。
+    """
+
+    name = "szggzy"
+    home = "https://www.szggzy.com/"
+    API = "https://www.szggzy.com/cms/api/v1"
+    CHANNELS = [
+        {"channelId": 2850, "modelId": 1378,
+         "parentBusinessType": "政采框采", "category": "zfcg"},
+    ]
+    PAGE_SIZE = 20
+    # 列表 URL 用假路径编码 (channelId, page)，parse_list 再解回来
+    LIST_TPL = "szggzy://list?channelId={channelId}&modelId={modelId}&page={page}&pbt={pbt}"
+
+    def __init__(self) -> None:
+        # 缓存每个 contentId 的列表级元数据（项目编号、采购人、代理、中标人、金额、地区）
+        # parse_list 填充 → fetch_detail 读出拼到正文前面，让 extract_pipeline 直接捡到
+        self._meta: Dict[str, Dict[str, str]] = {}
+
+    def list_urls(self, page: int) -> List[str]:
+        # page: 用户侧 1-indexed；API 的 page 是 0-indexed
+        urls = []
+        for ch in self.CHANNELS:
+            urls.append(self.LIST_TPL.format(
+                channelId=ch["channelId"], modelId=ch["modelId"],
+                page=page - 1, pbt=ch["parentBusinessType"],
+            ))
+        return urls
+
+    # 保留当前 channel 上下文以便 parse_list 还原
+    def _ch_from_url(self, list_url: str) -> Dict:
+        m = re.match(r"szggzy://list\?channelId=(\d+)&modelId=(\d+)&page=(\d+)&pbt=(.+)", list_url)
+        if not m:
+            return self.CHANNELS[0]
+        return {"channelId": int(m.group(1)), "modelId": int(m.group(2)),
+                "page": int(m.group(3)), "parentBusinessType": m.group(4)}
+
+    def fetch_list(self, engine: "Engine", list_url: str, page: int) -> Optional[str]:
+        ch = self._ch_from_url(list_url)
+        body = {
+            "modelId": ch["modelId"], "channelId": ch["channelId"],
+            "fields": [], "jsgcProjectType": "",
+            "parentBusinessType": ch["parentBusinessType"],
+            "title": None, "releaseTimeBegin": None, "releaseTimeEnd": None,
+            "page": ch["page"], "size": self.PAGE_SIZE, "siteId": 1,
+        }
+        return engine._post_json(
+            f"{self.API}/trade/content/page",
+            body,
+            referer=f"{self.home}jygg/list.html?id=zfcg",
+        )
+
+    def parse_list(self, html: str, list_url: str) -> List[ListItem]:
+        try:
+            d = json.loads(html)
+        except Exception:
+            return []
+        recs = ((d.get("data") or {}).get("content")) or []
+        out: List[ListItem] = []
+        ch = self._ch_from_url(list_url)
+        for r in recs:
+            cid = r.get("contentId") or r.get("id")
+            if not cid:
+                continue
+            # 把元数据打包进一个详情"URL"：我们后面直接用它当去重键和详情取数 key。
+            detail = (f"{self.home}jygg/details.html?contentId={cid}"
+                      f"&channelId={ch['channelId']}")
+            rel = (r.get("releaseTime") or r.get("publishTime") or "")[:10]
+            cat_name = r.get("rank1NoticeTypeName") or r.get("noticeTypeName") or ""
+            # 缓存结构化字段，detail 阶段拼到正文前
+            self._meta[str(cid)] = {
+                "project_no": (r.get("projectCode") or r.get("tenderProjectNumber") or "").strip(),
+                "buyer":      (r.get("purchaseMan") or r.get("tenderer") or "").strip(),
+                "agent":      (r.get("proxyComName") or "").strip(),
+                "winner":     (r.get("winnerName") or r.get("winningBidder") or "").strip(),
+                "region":     (r.get("projectRegion") or r.get("areaName") or "").strip(),
+                "purchase_method": (r.get("purchaseMethod") or "").strip(),
+                "category":   cat_name,
+            }
+            out.append(ListItem(
+                url=detail,
+                title=r.get("title") or r.get("noticeTitle") or r.get("projectName") or "",
+                publish_date=rel,
+                category=f"szggzy/{ch['parentBusinessType']}/{cat_name}".strip("/"),
+            ))
+        return out
+
+    def fetch_detail(self, engine: "Engine", url: str, referer: str) -> Optional[str]:
+        m = re.search(r"contentId=(\d+)", url)
+        if not m:
+            return None
+        cid = m.group(1)
+        api = f"{self.API}/trade/content/detail2?contentId={cid}"
+        raw = engine._fetch(api, referer=url)
+        if not raw:
+            return None
+        try:
+            d = json.loads(raw)
+        except Exception:
+            return None
+        data = d.get("data") or {}
+        title = data.get("title") or ""
+        txt = data.get("txt") or ""
+        release = (data.get("releaseTime") or "")[:10]
+        # 结构化字段通过 pre_filled_fields 提供（优先于散文抽取），
+        # 详情 HTML 这里只暴露 txt 正文 + 标题 + 日期即可
+        wrapped = (f"<html><body>"
+                   f"<h1 class='szggzy-title'>{title}</h1>"
+                   f"<div class='szggzy-meta' data-date='{release}'></div>"
+                   f"<div class='szggzy-body'>{txt}</div>"
+                   f"</body></html>")
+        return wrapped
+
+    def parse_detail_hints(self, soup: BeautifulSoup, url: str):
+        tit = soup.select_one(".szggzy-title")
+        title = tit.get_text(strip=True) if tit else ""
+        meta = soup.select_one(".szggzy-meta")
+        publish_date = meta.get("data-date", "") if meta else ""
+        body = soup.select_one(".szggzy-body") or soup.body or soup
+        return title, body, "", publish_date
+
+    def pre_filled_fields(self, url: str) -> Dict[str, str]:
+        m = re.search(r"contentId=(\d+)", url)
+        if not m:
+            return {}
+        meta = self._meta.get(m.group(1), {})
+        return {k: meta.get(k, "") for k in ("project_no", "buyer", "agent",
+                                             "winner", "region")}
+
+
+class SustechSite(BaseSite):
+    """南方科大采购与招标信息网 (biddingoffice.sustech.edu.cn)。
+
+    列表是纯 HTML，6 个栏目对应不同 sort_id：
+        7   校集采公开招标公告
+        8   政集采招标公告
+        11  校集采公开招标结果公告
+        12  政集采结果公告
+        57  校集采非公开招标公告
+        58  校集采非公开成交公告
+
+    每个栏目列表 URL: /tender/index/pid/2/sort_id/{SID}     (第 1 页)
+                      /tender/index/pid/2/sort_id/{SID}/p/N (第 N 页)
+    详情 URL: /tender/news/id/{ID}/pid/2
+        详情页是"带外链的存根"，真正正文在 biddingholdings.sustech.edu.cn。
+        fetch_detail 会自动跟随外链，把外部正文作为 body 返回，保证字段抽取准确。
+    """
+
+    name = "sustech"
+    home = "https://biddingoffice.sustech.edu.cn/"
+    SORTS = {
+        7:  "校集采公开招标公告",
+        8:  "政集采招标公告",
+        11: "校集采公开招标结果公告",
+        12: "政集采结果公告",
+        57: "校集采非公开招标公告",
+        58: "校集采非公开成交公告",
+    }
+
+    def list_urls(self, page: int) -> List[str]:
+        out = []
+        for sid in self.SORTS:
+            if page == 1:
+                out.append(f"https://biddingoffice.sustech.edu.cn/tender/index/pid/2/sort_id/{sid}")
+            else:
+                out.append(f"https://biddingoffice.sustech.edu.cn/tender/index/pid/2/sort_id/{sid}/p/{page}")
+        return out
+
+    def parse_list(self, html: str, list_url: str) -> List[ListItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        out: List[ListItem] = []
+        m_sid = re.search(r"/sort_id/(\d+)", list_url)
+        cat = self.SORTS.get(int(m_sid.group(1)), "") if m_sid else ""
+        for a in soup.find_all("a", href=True):
+            if not re.search(r"/tender/news/id/\d+", a["href"]):
+                continue
+            title = a.get_text(strip=True)
+            if not title:
+                continue
+            href = urljoin(list_url, a["href"])
+            # 日期通常在同一行或父级
+            date = ""
+            ctx = a.parent.get_text(" ", strip=True) if a.parent else ""
+            m = re.search(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", ctx)
+            if m:
+                date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+            out.append(ListItem(
+                url=href, title=title, publish_date=date,
+                category=f"sustech/{cat}",
+            ))
+        # 去重（同一页偶尔重复）
+        seen = set()
+        uniq = []
+        for it in out:
+            if it.url in seen:
+                continue
+            seen.add(it.url)
+            uniq.append(it)
+        return uniq
+
+    def fetch_detail(self, engine: "Engine", url: str, referer: str) -> Optional[str]:
+        stub = engine._fetch(url, referer=referer)
+        if not stub:
+            return None
+        # 尝试从 stub 里挖外链（biddingholdings.sustech.edu.cn/shows/...）
+        m = re.search(r"https?://biddingholdings\.sustech\.edu\.cn/[^\s\"'<>]+\.html?",
+                      stub)
+        if not m:
+            return stub  # 没外链就用 stub 本身（少量站内正文）
+        ext_url = m.group(0)
+        engine._sleep()
+        ext_html = engine._fetch(ext_url, referer=url)
+        if not ext_html:
+            return stub
+        # 把外链正文包一层，保留原 stub 的 meta（date 等）
+        return (f"<html><body>"
+                f"<div class='sustech-stub'>{stub}</div>"
+                f"<div class='sustech-ext' data-ext-url='{ext_url}'>{ext_html}</div>"
+                f"</body></html>")
+
+    def parse_detail_hints(self, soup: BeautifulSoup, url: str):
+        # 优先用外链的正文
+        ext = soup.select_one(".sustech-ext")
+        if ext:
+            # 外链页常见的正文容器 (wp_articlecontent / article / content)
+            body = (ext.select_one(".wp_articlecontent")
+                    or ext.select_one(".article")
+                    or ext.select_one("#content")
+                    or ext.select_one(".content")
+                    or ext)
+            tit = (ext.select_one("h1, h2, .title, .article-title")
+                   or soup.select_one(".sustech-stub h1, .sustech-stub h2, .sustech-stub .title"))
+        else:
+            body = soup.select_one(".article, .news-content, .content, #content") or soup.body or soup
+            tit = soup.select_one("h1, h2, .title, .news-title")
+        title = tit.get_text(strip=True) if tit else ""
+        # 日期从 stub 文本里挖
+        publish_date = ""
+        m = re.search(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})",
+                      (soup.select_one(".sustech-stub") or soup).get_text(" ", strip=True)[:1500])
+        if m:
+            publish_date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        return title, body, "", publish_date
+
+
 # 注册表：CLI --sites 的取值映射到插件工厂
 SITE_REGISTRY: Dict[str, Callable[..., BaseSite]] = {
     "ccgp":     CCGPSite,       # 特殊：需要 keyword/start/end 参数
@@ -647,6 +929,8 @@ SITE_REGISTRY: Dict[str, Callable[..., BaseSite]] = {
     "ipp":      IPPSite,
     "ihep":     IHEPSite,
     "caep":     CAEPSite,
+    "szggzy":   SzggzySite,
+    "sustech":  SustechSite,
 }
 
 
@@ -726,6 +1010,28 @@ class Engine:
             time.sleep((2 ** i) + random.random())
         return None
 
+    def _post_json(self, url: str, body: Dict, referer: str = "",
+                   retries: int = 3) -> Optional[str]:
+        """给 JSON API 站点用的 POST。返回原始 response.text (应为 JSON 字符串)。"""
+        headers = _headers(referer or url)
+        headers["Content-Type"] = "application/json;charset=UTF-8"
+        headers["Accept"] = "application/json, text/plain, */*"
+        headers["Origin"] = re.match(r"^(https?://[^/]+)", url).group(1)
+        for i in range(retries):
+            try:
+                r = self.session.post(
+                    url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    headers=headers, timeout=25, allow_redirects=True,
+                )
+                r.encoding = r.apparent_encoding or "utf-8"
+                if r.status_code == 200:
+                    return r.text
+                log.warning("POST %s -> HTTP %s", url, r.status_code)
+            except requests.RequestException as e:
+                log.warning("POST failed %s: %s", url, e)
+            time.sleep((2 ** i) + random.random())
+        return None
+
     # ---- 关键词过滤 -----------------------------------------------------
     def _matches_keyword(self, notice: Notice) -> bool:
         if not self.keywords:
@@ -739,7 +1045,14 @@ class Engine:
         soup = BeautifulSoup(html, "html.parser")
         title, body_el, category, publish_date = site.parse_detail_hints(soup, url)
         text = body_el.get_text("\n", strip=True) if body_el else ""
-        fields = extract_pipeline(body_el or soup, text)
+        # pre-filled (站点已经结构化拿到的) > extract_pipeline (散文抽取)
+        pre = {k: v for k, v in site.pre_filled_fields(url).items()
+               if k in FIELD_PATTERNS and v}
+        extracted = extract_pipeline(body_el or soup, text)
+        fields = {k: "" for k in FIELD_PATTERNS}
+        fields.update(extracted)
+        for k, v in pre.items():
+            fields[k] = v  # 列表 API 的字段最权威，覆盖抽取
         if self.llm:
             for k, v in self._llm_fill_missing(text, fields).items():
                 if v and not fields.get(k):
@@ -764,7 +1077,7 @@ class Engine:
             page_hit = 0
             for list_url in list_urls:
                 log.info("[%s p%d] %s", site.name, page, list_url)
-                html = self._fetch(list_url, referer=site.home)
+                html = site.fetch_list(self, list_url, page)
                 if not html:
                     continue
                 items = site.parse_list(html, list_url)
@@ -773,7 +1086,7 @@ class Engine:
                     if self.store.has(it.url):
                         continue
                     self._sleep()
-                    dhtml = self._fetch(it.url, referer=list_url)
+                    dhtml = site.fetch_detail(self, it.url, referer=list_url)
                     if not dhtml:
                         continue
                     try:
