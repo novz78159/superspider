@@ -475,28 +475,36 @@ class CCGPSpider:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="ccgp.gov.cn 关键词爬虫")
-    ap.add_argument("--kw", required=True, help="搜索关键词")
+    ap.add_argument("--kw", required=True,
+                    help="搜索关键词；多个用英文逗号分隔，例如 "
+                         "'质谱仪,X射线,光源,光学元件,光谱仪'")
     ap.add_argument("--start", default="2025-01-01", help="开始日期 YYYY-MM-DD")
     ap.add_argument("--end", default=datetime.now().strftime("%Y-%m-%d"),
                     help="结束日期 YYYY-MM-DD")
-    ap.add_argument("--pages", type=int, default=3, help="抓取前 N 页")
+    ap.add_argument("--pages", type=int, default=3, help="每个关键词抓取前 N 页")
     ap.add_argument("--out", default="output/ccgp", help="输出目录")
     ap.add_argument("--use-llm", action="store_true",
                     help="启用 LLM 兜底（需要 OPENAI_API_KEY）")
     args = ap.parse_args()
 
-    spider = CCGPSpider(
-        keyword=args.kw,
-        start=args.start,
-        end=args.end,
-        out_dir=Path(args.out),
-        max_pages=args.pages,
-        use_llm=args.use_llm,
-    )
-    try:
-        spider.run()
-    except KeyboardInterrupt:
-        log.info("user interrupt")
+    keywords = [k.strip() for k in args.kw.split(",") if k.strip()]
+    total_all = 0
+    for kw in keywords:
+        log.info("========= 关键词: %s =========", kw)
+        spider = CCGPSpider(
+            keyword=kw,
+            start=args.start,
+            end=args.end,
+            out_dir=Path(args.out),
+            max_pages=args.pages,
+            use_llm=args.use_llm,
+        )
+        try:
+            total_all += spider.run()
+        except KeyboardInterrupt:
+            log.info("user interrupt")
+            break
+    log.info("全部结束。总共新增 %d 条", total_all)
     return 0
 
 
