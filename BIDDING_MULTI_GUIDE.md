@@ -15,6 +15,7 @@
 | `sustech` | 南方科大采购与招标管理部 | https://bidding.sustech.edu.cn/ | 列表+外链跟进 |
 | `qdu` | 青岛大学政府采购中心 | https://cg.qdu.edu.cn/ | 6 子栏目 + AJAX 翻页（含 ms token） |
 | `shanghaitech` | 上海科技大学招标采购信息 | https://www.shanghaitech.edu.cn/1428/ | SiteFactory CMS, list1.htm 翻页 |
+| `wisdombidding` | 高校快采平台（采管鹰） | https://www.wisdombidding.com/largePurchase | **必须用国内 IP**（境外/海外 IP 在 TCP 层被拦） |
 
 ### qdu/shanghaitech 字段质量提示
 
@@ -33,17 +34,20 @@
 | 广东教育部门零散采购 (`gdedulscg.cn`) | 详情需账号（ASP.NET ViewState） | 登录后的 cookie 或账号密码 |
 | 机电产品招标 (`chinabidding.com`) | 详情页需注册登录 | 登录后的 cookie 或账号密码 |
 | 比联网 (`ebnew.com`) | 详情页需注册登录 | 登录后的 cookie 或账号密码 |
-| 高校快速采购 (`wisdombidding.com`) | VM 出口 IP 连不上（Aliyun 116.62.194.253 拦截境外/海外 IP） | 需用国内 IP 跑或提供代理 |
+
 
 ## 用法
 
 ```bash
-# 9 个站点 + 5 个关键词 + 前 3 页（每站每关键词）
+# 10 个站点 + 5 个关键词 + 前 3 页（每站每关键词）
 python pyspider/examples/bidding_multi_spider.py \
-    --sites ccgp,ustc_zhc,ipp,ihep,caep,szggzy,sustech,qdu,shanghaitech \
+    --sites ccgp,ustc_zhc,ipp,ihep,caep,szggzy,sustech,qdu,shanghaitech,wisdombidding \
     --kw 质谱仪,X射线,光源,光学元件,光谱仪 \
     --start 2025-01-01 --end 2025-12-31 \
     --pages 3 --out output/bidding --use-llm
+
+# wisdombidding 注意：必须从国内 IP 跑（aliyun 116.62.194.253 拦境外）
+# 列表已含全部主要字段，详情页 /enquiryDetail/{id} 公开可访问
 ```
 
 - `--sites`：逗号分隔的站点代号，默认 `ccgp,ustc_zhc,ipp,ihep,caep`

@@ -1121,17 +1121,154 @@ class ShanghaiTechSite(BaseSite):
         return title, body, "", publish_date
 
 
+class WisdomBiddingSite(BaseSite):
+    """高校快采平台 (采管鹰 / wisdombidding.com) 的 /largePurchase 列表。
+
+    要点：
+    - 服务端渲染，列表 HTML 已含完整字段；通过 pre_filled_fields 直接喂引擎
+    - 翻页是 POST /largePurchase + form-encoded {pageNum, pageSize, csrf_token,
+      submitByForm}；csrf_token 从首页提取
+    - 详情页 /enquiryDetail/{id} 公开可访问（无需登录）
+    - 注意：本站从境外/海外 IP 访问会被 TCP 层拦截，必须使用国内 IP / 代理"""
+
+    name = "wisdombidding"
+    home = "https://www.wisdombidding.com/"
+    LIST_PATH = "/largePurchase"
+
+    def __init__(self) -> None:
+        self._csrf: Optional[str] = None
+        self._page1_html: Optional[str] = None
+
+    # 引擎用 list_urls + fetch_list 形式调度。我们用 sentinel URL，自己接管 POST
+    def list_urls(self, page: int) -> List[str]:
+        return [f"wisdom://list?page={page}"]
+
+    @staticmethod
+    def _ensure_csrf(engine: "Engine", site: "WisdomBiddingSite") -> Optional[str]:
+        if site._csrf:
+            return site._csrf
+        # 访问首页拿 csrf_token，从任意带 csrf_token=... 的链接里提取
+        html = engine._fetch(site.home)
+        if not html:
+            return None
+        m = re.search(r"csrf_token=([0-9]+)", html)
+        if not m:
+            log.error("[wisdombidding] 主页拿不到 csrf_token，可能 IP 被拦")
+            return None
+        site._csrf = m.group(1)
+        log.info("[wisdombidding] csrf_token=%s", site._csrf)
+        return site._csrf
+
+    def fetch_list(self, engine: "Engine", list_url: str, page: int) -> Optional[str]:
+        token = self._ensure_csrf(engine, self)
+        if not token:
+            return None
+        if page == 1:
+            url = f"{self.home.rstrip('/')}{self.LIST_PATH}?csrf_token={token}"
+            self._page1_html = engine._fetch(url)
+            return self._page1_html
+        # 翻页 POST
+        body = {
+            "pageNum": str(page),
+            "pageSize": "20",
+            "submitByForm": "Y",
+            "csrf_token": token,
+        }
+        return engine._post_form(
+            f"{self.home.rstrip('/')}{self.LIST_PATH}",
+            body,
+            referer=f"{self.home.rstrip('/')}{self.LIST_PATH}?csrf_token={token}",
+        )
+
+    def parse_list(self, html: str, list_url: str) -> List[ListItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        items: List[ListItem] = []
+        seen: set = set()
+        # 每条公告是一个 <tr enquiryMainId="..."> 行
+        for tr in soup.find_all("tr"):
+            mid = tr.get("enquirymainid") or tr.get("enquiryMainId")
+            if not mid:
+                continue
+            a = tr.select_one("a.projectName") or tr.find("a", href=re.compile(r"/enquiryDetail/"))
+            if not a:
+                continue
+            href = a.get("href", "")
+            url = urljoin(self.home, href)
+            if url in seen:
+                continue
+            seen.add(url)
+            # title 用 a[title] 完整值（DOM 文本会被 wqzEllipsis 截）
+            title = (a.get("title") or a.get_text(strip=True) or "").strip()
+            # 发布日期：<div>发布：YYYY-MM-DD</div>
+            date = ""
+            for div in tr.find_all("div"):
+                t = div.get_text(strip=True)
+                m = re.search(r"(20\d{2})-(\d{2})-(\d{2})", t)
+                if m and ("发布" in t or "发" in t):
+                    date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                    break
+            items.append(ListItem(url=url, title=title, publish_date=date))
+        return items
+
+    # 详情页 stub：列表已含全部字段，直接走 pre_filled_fields
+    def parse_detail_hints(self, soup: BeautifulSoup, url: str):
+        # 详情页正文容器多变，尽量保守
+        body = (soup.select_one(".enquiryDetail")
+                or soup.select_one(".detail")
+                or soup.select_one(".content")
+                or soup.body or soup)
+        title = ""
+        for sel in [".enquiryDetail h1", ".detail h1", "h1", "h2", ".title"]:
+            el = soup.select_one(sel)
+            if el and el.get_text(strip=True):
+                title = el.get_text(strip=True)
+                break
+        return title, body, "", ""
+
+    # 关键：列表里已经有 project_no / buyer / category，直接 pre-fill
+    def pre_filled_fields(self, url: str) -> Dict[str, str]:
+        # 注意：此方法在 process 时调用，需要 list HTML 还在 self._page1_html 中
+        # 由于 Engine 调用顺序是 fetch_list -> parse_list -> 对每个 ListItem 调
+        # fetch_detail/parse_detail_hints/pre_filled_fields，我们重解析 page1
+        # 来定位本条 url 对应的 row
+        if not self._page1_html:
+            return {}
+        soup = BeautifulSoup(self._page1_html, "html.parser")
+        for tr in soup.find_all("tr"):
+            a = tr.select_one("a.projectName") or tr.find("a", href=re.compile(r"/enquiryDetail/"))
+            if not a:
+                continue
+            href = urljoin(self.home, a.get("href", ""))
+            if href != url:
+                continue
+            out: Dict[str, str] = {}
+            # project_no（编号里可能含中文字符，例如"中大招（货）[2026]026号"）
+            pc = tr.select_one(".projectCode")
+            if pc:
+                t = pc.get_text(strip=True)
+                m = re.search(r"[:：]\s*(\S.{0,80}?)\s*$", t)
+                if m:
+                    out["project_no"] = m.group(1).strip()
+            # buyer
+            cn = tr.select_one(".collegeName a") or tr.select_one(".collegeName")
+            if cn:
+                out["buyer"] = (cn.get("title") or cn.get_text(strip=True)).strip()
+            return out
+        return {}
+
+
 # 注册表：CLI --sites 的取值映射到插件工厂
 SITE_REGISTRY: Dict[str, Callable[..., BaseSite]] = {
-    "ccgp":         CCGPSite,       # 特殊：需要 keyword/start/end 参数
-    "ustc_zhc":     USTCZhcSite,
-    "ipp":          IPPSite,
-    "ihep":         IHEPSite,
-    "caep":         CAEPSite,
-    "szggzy":       SzggzySite,
-    "sustech":      SustechSite,
-    "qdu":          QDUSite,
-    "shanghaitech": ShanghaiTechSite,
+    "ccgp":          CCGPSite,       # 特殊：需要 keyword/start/end 参数
+    "ustc_zhc":      USTCZhcSite,
+    "ipp":           IPPSite,
+    "ihep":          IHEPSite,
+    "caep":          CAEPSite,
+    "szggzy":        SzggzySite,
+    "sustech":       SustechSite,
+    "qdu":           QDUSite,
+    "shanghaitech":  ShanghaiTechSite,
+    "wisdombidding": WisdomBiddingSite,
 }
 
 
