@@ -1317,6 +1317,36 @@ class Engine:
         return {k: str(v).strip() for k, v in ai.items() if v}
 
     # ---- HTTP -----------------------------------------------------------
+    @staticmethod
+    def _decode(r: "requests.Response") -> str:
+        """Decode response body using a Chinese-friendly encoding strategy.
+
+        chardet (`r.apparent_encoding`) often misclassifies UTF-8 Chinese as
+        GBK/GB2312, producing mojibake. Order of preference:
+          1. charset from HTTP Content-Type header (if explicitly set)
+          2. <meta charset=...> / <meta http-equiv="Content-Type"> in HTML
+          3. UTF-8 (modern Chinese sites default)
+          4. GB18030 fallback (legacy ASP/JSP sites)
+        """
+        ct = r.headers.get("Content-Type", "")
+        m = re.search(r"charset=([\w\-]+)", ct, re.I)
+        if m:
+            try:
+                return r.content.decode(m.group(1), errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                pass
+        head = r.content[:4096]
+        m = re.search(rb'<meta[^>]+charset=["\']?([\w\-]+)', head, re.I)
+        if m:
+            try:
+                return r.content.decode(m.group(1).decode("ascii"), errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                pass
+        try:
+            return r.content.decode("utf-8")
+        except UnicodeDecodeError:
+            return r.content.decode("gb18030", errors="replace")
+
     def _sleep(self) -> None:
         time.sleep(random.uniform(*self.delay))
 
@@ -1336,13 +1366,13 @@ class Engine:
                     url, headers=_headers(referer or url), timeout=25,
                     allow_redirects=True,
                 )
-                r.encoding = r.apparent_encoding or "utf-8"
+                text = self._decode(r)
                 if r.status_code != 200:
                     log.warning("%s -> HTTP %s", url, r.status_code)
-                elif "频繁" in r.text[:5000] or "blocked" in r.text[:1500].lower():
+                elif "频繁" in text[:5000] or "blocked" in text[:1500].lower():
                     log.warning("被限流：%s (attempt %d)", url, i + 1)
                 else:
-                    return r.text
+                    return text
             except requests.RequestException as e:
                 log.warning("request failed %s: %s", url, e)
             time.sleep((2 ** i) + random.random())
@@ -1361,9 +1391,8 @@ class Engine:
                     url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                     headers=headers, timeout=25, allow_redirects=True,
                 )
-                r.encoding = r.apparent_encoding or "utf-8"
                 if r.status_code == 200:
-                    return r.text
+                    return self._decode(r)
                 log.warning("POST %s -> HTTP %s", url, r.status_code)
             except requests.RequestException as e:
                 log.warning("POST failed %s: %s", url, e)
@@ -1384,9 +1413,8 @@ class Engine:
                     url, data=body, headers=headers,
                     timeout=25, allow_redirects=True,
                 )
-                r.encoding = r.apparent_encoding or "utf-8"
                 if r.status_code == 200:
-                    return r.text
+                    return self._decode(r)
                 log.warning("POST %s -> HTTP %s", url, r.status_code)
             except requests.RequestException as e:
                 log.warning("POST failed %s: %s", url, e)
