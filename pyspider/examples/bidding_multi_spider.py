@@ -922,15 +922,216 @@ class SustechSite(BaseSite):
         return title, body, "", publish_date
 
 
+class QDUSite(BaseSite):
+    """青岛大学政府采购中心 (cg.qdu.edu.cn)。
+
+    6 个栏目：cgxxhw / cgxxfw / cgxxgc (采购公告 货/服/工)
+            zbgghw / zbggfw / zbgggc (中标公告 货/服/工)
+    分页是 AJAX POST 到 /<channel>/260/article.chtml，需要带列表页里的
+    _queryspt / _paramspt 隐藏字段 + 自生成的 ms / ms1 / ms2 token。
+    """
+
+    name = "qdu"
+    home = "https://cg.qdu.edu.cn/"
+    CHANNELS = ["cgxxhw", "cgxxfw", "cgxxgc",
+                "zbgghw", "zbggfw", "zbgggc"]
+    LIST_TPL = "qdu://list?channel={channel}&page={page}"
+
+    def __init__(self) -> None:
+        # 缓存每个 channel 第 1 页 HTML 里的隐藏字段 + 总页数 + 列表项
+        # ListItem 已经在 list 页里拿到日期 / 标题 / URL，直接放进去
+        self._channel_state: Dict[str, Dict] = {}
+        # 详情 URL -> 列表页拿到的 (title, date, channel)
+        self._list_meta: Dict[str, Dict[str, str]] = {}
+
+    def list_urls(self, page: int) -> List[str]:
+        return [self.LIST_TPL.format(channel=c, page=page) for c in self.CHANNELS]
+
+    @staticmethod
+    def _ch_from_url(url: str) -> Tuple[str, int]:
+        m = re.match(r"qdu://list\?channel=([^&]+)&page=(\d+)", url)
+        return m.group(1), int(m.group(2))
+
+    @staticmethod
+    def _gen_ms() -> Tuple[str, str, str]:
+        import string, time, uuid
+        digits = string.digits + string.ascii_lowercase
+        n = int(time.time()); s = ""
+        while n:
+            s = digits[n % 36] + s
+            n //= 36
+        ms = s
+        ms1 = uuid.uuid4().hex
+        out = []
+        for i in range(max(len(ms), len(ms1))):
+            if i < len(ms):  out.append(ms[i])
+            if i < len(ms1): out.append(ms1[i])
+        return ms, ms1, "".join(out)
+
+    def _ensure_channel_state(self, engine: "Engine", channel: str) -> Optional[Dict]:
+        st = self._channel_state.get(channel)
+        if st:
+            return st
+        url = f"{self.home}{channel}/index.chtml"
+        html = engine._fetch(url, referer=self.home)
+        if not html:
+            return None
+        hidden: Dict[str, str] = {}
+        for m in re.finditer(r'<input[^>]+type="hidden"[^>]*>', html):
+            tag = m.group(0)
+            n = re.search(r'name="([^"]+)"', tag)
+            v = re.search(r'value="([^"]*)"', tag)
+            if n:
+                hidden[n.group(1)] = v.group(1) if v else ""
+        # 总页数
+        total = 1
+        m = re.search(r"parseInt\('(\d+)'\)\s*\|\|\s*parseInt\(cpage\)\s*<\s*0", html)
+        if not m:
+            m = re.search(r"submitSplitPage\('(\d+)'\)", html)
+        if m:
+            total = int(m.group(1))
+        st = {"hidden": hidden, "total": total, "first_html": html, "url": url}
+        self._channel_state[channel] = st
+        return st
+
+    def fetch_list(self, engine: "Engine", list_url: str, page: int) -> Optional[str]:
+        channel, pg = self._ch_from_url(list_url)
+        st = self._ensure_channel_state(engine, channel)
+        if not st:
+            return None
+        if pg == 1:
+            return st["first_html"]
+        if pg > st["total"]:
+            return None
+        ms, ms1, ms2 = self._gen_ms()
+        body = dict(st["hidden"])
+        body.update({"curPage": str(pg), "splitFlag": "1",
+                     "ms": ms, "ms1": ms1, "ms2": ms2})
+        return engine._post_form(
+            f"{self.home}{channel}/260/article.chtml",
+            body,
+            referer=st["url"],
+            xhr=True,
+        )
+
+    def parse_list(self, html: str, list_url: str) -> List[ListItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        channel, _ = self._ch_from_url(list_url)
+        items: List[ListItem] = []
+        seen: set = set()
+        # 详情链接形如 /cgxxhw/9686.chtml
+        for a in soup.find_all("a", href=True):
+            m = re.match(rf"/?{channel}/(\d+)\.chtml$", a["href"])
+            if not m:
+                continue
+            url = urljoin(self.home, a["href"])
+            if url in seen:
+                continue
+            seen.add(url)
+            title = a.get("title") or a.get_text(" ", strip=True)
+            # 日期常在父级 li/tr 里
+            date = ""
+            parent = a.find_parent(["li", "tr", "div", "td"])
+            if parent:
+                m2 = re.search(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})",
+                               parent.get_text(" ", strip=True))
+                if m2:
+                    date = f"{m2.group(1)}-{int(m2.group(2)):02d}-{int(m2.group(3)):02d}"
+            self._list_meta[url] = {"title": title, "date": date, "channel": channel}
+            items.append(ListItem(url=url, title=title, publish_date=date))
+        return items
+
+    def parse_detail_hints(self, soup: BeautifulSoup, url: str):
+        meta = self._list_meta.get(url, {})
+        title = ""
+        for sel in ["h1", "h2", ".title", ".v_news_content h1",
+                    ".article-title", ".content_title"]:
+            el = soup.select_one(sel)
+            if el and el.get_text(strip=True):
+                title = el.get_text(strip=True)
+                break
+        if not title:
+            title = meta.get("title", "")
+        body = (soup.select_one(".content")
+                or soup.select_one(".article")
+                or soup.select_one(".v_news_content")
+                or soup.select_one("#vsb_content")
+                or soup.select_one(".TRS_Editor")
+                or soup.body or soup)
+        publish_date = meta.get("date", "")
+        if not publish_date:
+            m = re.search(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})",
+                          (body.get_text(" ", strip=True) if body else "")[:800])
+            if m:
+                publish_date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        cat = meta.get("channel", "")
+        return title, body, cat, publish_date
+
+
+class ShanghaiTechSite(BaseSite):
+    """上海科技大学招标采购信息 (www.shanghaitech.edu.cn/1428)。
+
+    SiteFactory CMS：列表页 /1428/listN.htm（N 从 1 开始），每页 14 条。
+    详情页 /YYYY/MMDD/c1428aNNNNN/page.htm，正文在 .wp_articlecontent。
+    日期可从 URL 直接解析。
+    """
+
+    name = "shanghaitech"
+    home = "https://www.shanghaitech.edu.cn/1428/"
+
+    def list_urls(self, page: int) -> List[str]:
+        return [f"https://www.shanghaitech.edu.cn/1428/list{page}.htm"]
+
+    def parse_list(self, html: str, list_url: str) -> List[ListItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        items: List[ListItem] = []
+        seen: set = set()
+        for a in soup.find_all("a", href=True):
+            m = re.search(r"/(20\d{2})/(\d{2})(\d{2})/c1428a\d+/page\.htm$", a["href"])
+            if not m:
+                continue
+            url = urljoin("https://www.shanghaitech.edu.cn/", a["href"])
+            if url in seen:
+                continue
+            seen.add(url)
+            title = (a.get("title")
+                     or a.get_text(" ", strip=True)
+                     or "")
+            date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            items.append(ListItem(url=url, title=title, publish_date=date))
+        return items
+
+    def parse_detail_hints(self, soup: BeautifulSoup, url: str):
+        title = ""
+        for sel in [".wp_articlecontent h1", ".article-title", "h1.arti_title",
+                    ".content_title", "h1", "h2"]:
+            el = soup.select_one(sel)
+            if el and el.get_text(strip=True):
+                title = el.get_text(strip=True)
+                break
+        body = (soup.select_one(".wp_articlecontent")
+                or soup.select_one(".article")
+                or soup.select_one(".v_news_content")
+                or soup.body or soup)
+        # URL 上的日期最权威
+        publish_date = ""
+        m = re.search(r"/(20\d{2})/(\d{2})(\d{2})/c1428a\d+/", url)
+        if m:
+            publish_date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        return title, body, "", publish_date
+
+
 # 注册表：CLI --sites 的取值映射到插件工厂
 SITE_REGISTRY: Dict[str, Callable[..., BaseSite]] = {
-    "ccgp":     CCGPSite,       # 特殊：需要 keyword/start/end 参数
-    "ustc_zhc": USTCZhcSite,
-    "ipp":      IPPSite,
-    "ihep":     IHEPSite,
-    "caep":     CAEPSite,
-    "szggzy":   SzggzySite,
-    "sustech":  SustechSite,
+    "ccgp":         CCGPSite,       # 特殊：需要 keyword/start/end 参数
+    "ustc_zhc":     USTCZhcSite,
+    "ipp":          IPPSite,
+    "ihep":         IHEPSite,
+    "caep":         CAEPSite,
+    "szggzy":       SzggzySite,
+    "sustech":      SustechSite,
+    "qdu":          QDUSite,
+    "shanghaitech": ShanghaiTechSite,
 }
 
 
@@ -1022,6 +1223,29 @@ class Engine:
                 r = self.session.post(
                     url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                     headers=headers, timeout=25, allow_redirects=True,
+                )
+                r.encoding = r.apparent_encoding or "utf-8"
+                if r.status_code == 200:
+                    return r.text
+                log.warning("POST %s -> HTTP %s", url, r.status_code)
+            except requests.RequestException as e:
+                log.warning("POST failed %s: %s", url, e)
+            time.sleep((2 ** i) + random.random())
+        return None
+
+    def _post_form(self, url: str, body: Dict, referer: str = "",
+                   xhr: bool = False, retries: int = 3) -> Optional[str]:
+        """给传统 form-encoded POST 站点用的助手 (e.g. QDU 的 AJAX 翻页)。"""
+        headers = _headers(referer or url)
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if xhr:
+            headers["X-Requested-With"] = "XMLHttpRequest"
+        headers["Origin"] = re.match(r"^(https?://[^/]+)", url).group(1)
+        for i in range(retries):
+            try:
+                r = self.session.post(
+                    url, data=body, headers=headers,
+                    timeout=25, allow_redirects=True,
                 )
                 r.encoding = r.apparent_encoding or "utf-8"
                 if r.status_code == 200:

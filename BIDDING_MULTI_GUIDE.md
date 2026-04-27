@@ -2,36 +2,45 @@
 
 在 `ccgp_keyword_spider.py` 抽取能力的基础上，把抓取流程抽象为 **"引擎 + 站点插件"** 两层。想接入一个新网站，只需要实现一个继承 `BaseSite` 的类即可，不用重写限流 / 去重 / 抽取 / LLM 兜底。
 
-## 已接入（阶段 1，纯 HTML，无需登录）
+## 已接入
 
-| 代号 | 站点 | 入口 |
+| 代号 | 站点 | 入口 | 备注 |
+|---|---|---|---|
+| `ccgp` | 中国政府采购网 | https://search.ccgp.gov.cn/bxsearch | 站内搜索 |
+| `ustc_zhc` | 中科大资产与后勤处 | https://zhc.ustc.edu.cn/10843/list.htm | 全量+本地过滤 |
+| `ipp` | 等离子体物理研究所采购平台 | http://www.ipp.ac.cn/ztbxx/zbxx/ | 字段最全 |
+| `ihep` | 中科院高能所通知公告 | http://www.ihep.ac.cn/xwdt2022/tzgg_1/ | 杂在通知里 |
+| `caep` | 绵阳 CAEP 工物院招投标信息网 | https://ztbxx.caep.ac.cn/ | 4 子栏目 |
+| `szggzy` | 深圳公共资源交易网 | https://www.szggzy.com/ | 反向出 JSON API |
+| `sustech` | 南方科大采购与招标管理部 | https://bidding.sustech.edu.cn/ | 列表+外链跟进 |
+| `qdu` | 青岛大学政府采购中心 | https://cg.qdu.edu.cn/ | 6 子栏目 + AJAX 翻页（含 ms token） |
+| `shanghaitech` | 上海科技大学招标采购信息 | https://www.shanghaitech.edu.cn/1428/ | SiteFactory CMS, list1.htm 翻页 |
+
+### qdu/shanghaitech 字段质量提示
+
+这两站的 **结构化字段（buyer / agent）** 经常是**学校内部的中文缩写**（不是技术问题，是数据本身就这样）：
+
+- 青岛大学：`buyer = "青大"`, `agent = "山卓招咨有公"`（应为 "青岛大学" / "山东卓信招标咨询有限公司"）
+- 上海科大：标题在 `<title>` 是完整的；正文里也有些字段是简称
+
+标题、URL、日期、项目编号都是完整的；只是组织名称栏是缩写。如果需要完整名称，只能开 `--use-llm` 让 LLM 根据上下文反推（也只能猜个大概）。这是**站点公开数据本身的形态**，浏览器里看到的也是这样，不是抓取丢字符。
+
+## 尚未接入
+
+| 站点 | 阻碍 | 用户需提供 |
 |---|---|---|
-| `ccgp` | 中国政府采购网 | https://search.ccgp.gov.cn/bxsearch |
-| `ustc_zhc` | 中科大资产与后勤处 | https://zhc.ustc.edu.cn/10843/list.htm |
-| `ipp` | 等离子体物理研究所采购平台 | http://www.ipp.ac.cn/ztbxx/zbxx/ |
-| `ihep` | 中科院高能所通知公告 | http://www.ihep.ac.cn/xwdt2022/tzgg_1/ |
-| `caep` | 绵阳 CAEP 工物院招投标信息网 | https://ztbxx.caep.ac.cn/ |
-
-## 尚未接入（阶段 2，需要 cookie / 登录 / JS 渲染）
-
-| 站点 | 阻碍 |
-|---|---|
-| 青岛大学采购中心 (`zhaobiao.qdu.edu.cn`) | 域名已重定向到后勤处主页，招标子系统疑似下线 |
-| 上海科大 (`old.shanghaitech.edu.cn`) | 域名不解析，已迁移到新入口，需要提供新 URL |
-| 华东师大采购信息网 (`zcb.ecnu.edu.cn`) | 全站跳转到 SSO 登录，需要统一身份认证 cookie |
-| 广东教育部门零散采购 (`gdedulscg.cn`) | ASP.NET + ViewState，详情需账号 |
-| 机电产品招标 (`chinabidding.com`) | 详情页需注册登录 |
-| 比联网 (`ebnew.com`) | 详情页需注册登录 |
-| 深圳公共资源交易网 (`szggzy.com`) | SPA，需逆向 ajax 接口 |
-| 南方科大采招网 (`sustech.edu.cn`) | SPA / JS 渲染 |
-| 高校快速采购 (`wisdombidding.com`) | 首页访问超时，域名不稳定 |
+| 华东师大采购信息网 (`zcb.ecnu.edu.cn`) | 全站跳 SSO 登录 | 登录后的 cookie 或账号密码 |
+| 广东教育部门零散采购 (`gdedulscg.cn`) | 详情需账号（ASP.NET ViewState） | 登录后的 cookie 或账号密码 |
+| 机电产品招标 (`chinabidding.com`) | 详情页需注册登录 | 登录后的 cookie 或账号密码 |
+| 比联网 (`ebnew.com`) | 详情页需注册登录 | 登录后的 cookie 或账号密码 |
+| 高校快速采购 (`wisdombidding.com`) | VM 出口 IP 连不上（Aliyun 116.62.194.253 拦截境外/海外 IP） | 需用国内 IP 跑或提供代理 |
 
 ## 用法
 
 ```bash
-# 5 个站点 + 5 个关键词 + 前 3 页（每站每关键词）
+# 9 个站点 + 5 个关键词 + 前 3 页（每站每关键词）
 python pyspider/examples/bidding_multi_spider.py \
-    --sites ccgp,ustc_zhc,ipp,ihep,caep \
+    --sites ccgp,ustc_zhc,ipp,ihep,caep,szggzy,sustech,qdu,shanghaitech \
     --kw 质谱仪,X射线,光源,光学元件,光谱仪 \
     --start 2025-01-01 --end 2025-12-31 \
     --pages 3 --out output/bidding --use-llm
